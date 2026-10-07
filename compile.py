@@ -40,14 +40,14 @@ def get_tensor_elem_type(graph, tensor_name):
     return TensorProto.FLOAT16  # Default fallback for quantized models
 
 def decompose_simplified_layer_norm_in_place(model):
-    """Decompose com.microsoft:SimplifiedLayerNormalization into standard ONNX ops in-place."""
+    """Decompose com.microsoft:SimplifiedLayerNormalization and RMSNorm into standard ONNX ops in-place."""
     graph = model.graph
     ordered_nodes = []
     new_initializers = []
     counter = 0
 
     for node in graph.node:
-        if node.op_type == "SimplifiedLayerNormalization":
+        if node.op_type in ["SimplifiedLayerNormalization", "RMSNorm"]:
             x_input = node.input[0]
             w_input = node.input[1]
             y_output = node.output[0]
@@ -100,18 +100,18 @@ def decompose_simplified_layer_norm_in_place(model):
             # 6. Mul(norm, W) -> Y
             node_mul_w = helper.make_node("Mul", inputs=[norm, w_input], outputs=[y_output], name=prefix+"mul_w")
             
-            # Insert standard nodes IN-PLACE where SimplifiedLayerNormalization was
+            # Insert standard nodes IN-PLACE where custom norm was
             ordered_nodes.extend([node_mul_sq, node_red, node_add, node_sqrt, node_div, node_mul_w])
         else:
             ordered_nodes.append(node)
 
     if counter > 0:
-        print(f"Decomposed {counter} 'SimplifiedLayerNormalization' nodes in-place (topological order preserved)...")
+        print(f"Decomposed {counter} custom normalization nodes in-place (topological order preserved)...")
         del graph.node[:]
         graph.node.extend(ordered_nodes)
         graph.initializer.extend(new_initializers)
     else:
-        print("No 'SimplifiedLayerNormalization' nodes found to decompose.")
+        print("No custom normalization nodes found to decompose.")
         
     return model
 
@@ -167,13 +167,13 @@ def main():
     # 6. Decompose non-standard nodes IN-PLACE
     onnx_model = decompose_simplified_layer_norm_in_place(onnx_model)
 
-    # 7. Local graph integrity check
-    print("Verifying graph topological sorting and node validity...")
-    onnx.checker.check_model(onnx_model, full_check=False)
-
-    # 8. Save updated model back to staging directory
+    # 7. Save modified ONNX model to staging directory FIRST
     print(f"Saving modified ONNX model to '{staged_onnx_path}'...")
     onnx.save(onnx_model, staged_onnx_path)
+
+    # 8. Local graph integrity check on saved file
+    print("Verifying graph topological sorting and external data paths...")
+    onnx.checker.check_model(staged_onnx_path, full_check=False)
 
     target_device = get_target_device()
 

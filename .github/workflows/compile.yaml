@@ -26,14 +26,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install qai-hub onnx
 
+      - name: Configure Qualcomm AI Hub Credentials
+        env:
+          QAI_HUB_TOKEN: ${{ secrets.QAI_HUB_API_TOKEN }}
+        run: |
+          qai-hub configure --api_token $QAI_HUB_TOKEN
+
       - name: Download ONNX Model File
         run: |
           echo "Downloading model from: ${{ github.event.inputs.onnx_url }}"
           wget -O model.onnx "${{ github.event.inputs.onnx_url }}"
 
       - name: Run Qualcomm AI Hub Compiler
-        env:
-          QAI_HUB_TOKEN: ${{ secrets.QAI_HUB_API_TOKEN }}
         run: |
           python compile.py
 

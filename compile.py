@@ -3,9 +3,16 @@ import sys
 import qai_hub as hub
 from huggingface_hub import hf_hub_download
 
+def clean_repo_id(repo_input):
+    """Sanitize full Hugging Face URLs into clean 'namespace/repo' format."""
+    repo = repo_input.strip()
+    for prefix in ["https://huggingface.co/", "http://huggingface.co/"]:
+        if repo.startswith(prefix):
+            repo = repo[len(prefix):]
+    return repo.strip("/")
+
 def download_hf_file(repo_id, filename):
     print(f"Downloading '{filename}' from HuggingFace repo '{repo_id}'...")
-    # hf_hub_download handles Git LFS binaries and redirects automatically
     file_path = hf_hub_download(repo_id=repo_id, filename=filename)
     return file_path
 
@@ -28,7 +35,9 @@ def get_target_device():
     return all_devices[0]
 
 def main():
-    repo_id = os.environ.get("HF_REPO_ID", "onnx-community/Qwen2.5-Coder-3B-Instruct")
+    raw_repo_id = os.environ.get("HF_REPO_ID", "onnx-community/Qwen2.5-Coder-3B-Instruct")
+    repo_id = clean_repo_id(raw_repo_id)
+    
     model_filename = os.environ.get("HF_MODEL_FILE", "onnx/model_q4.onnx")
     data_filename = os.environ.get("HF_DATA_FILE", "onnx/model_q4.onnx_data")
 

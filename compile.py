@@ -32,8 +32,18 @@ def get_target_device():
 
     return all_devices[0]
 
+def get_tensor_elem_type(graph, tensor_name):
+    """Find data element type of a tensor from initializers, value_info, inputs, or outputs."""
+    for init in graph.initializer:
+        if init.name == tensor_name:
+            return init.data_type
+    for info in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if info.name == tensor_name and info.type.HasField("tensor_type"):
+            return info.type.tensor_type.elem_type
+    return TensorProto.FLOAT  # Default to float32 if unspecified
+
 def decompose_layer_norm(model):
-    """Replaces custom Microsoft LayerNorm with standard ONNX math ops in-place."""
+    """Replaces custom LayerNorm/RMSNorm with standard ONNX math ops using matching data types."""
     graph = model.graph
     ordered_nodes = []
     new_initializers = []
@@ -44,13 +54,21 @@ def decompose_layer_norm(model):
             x_input, w_input, y_output = node.input[0], node.input[1], node.output[0]
             epsilon, axis = 1e-5, -1
             for attr in node.attribute:
-                if attr.name == "epsilon": epsilon = attr.f
-                elif attr.name == "axis": axis = attr.i
+                if attr.name == "epsilon": 
+                    epsilon = attr.f
+                elif attr.name == "axis": 
+                    axis = attr.i
+            
+            # Match epsilon data type dynamically to the scale parameter (w_input)
+            elem_type = get_tensor_elem_type(graph, w_input)
             
             prefix = f"sln_decomp_{counter}_"
             counter += 1
             eps_name = prefix + "eps"
-            new_initializers.append(helper.make_tensor(eps_name, TensorProto.FLOAT16, [], [epsilon]))
+            
+            # Create epsilon matching tensor precision (FLOAT vs FLOAT16)
+            eps_tensor = helper.make_tensor(eps_name, elem_type, [], [epsilon])
+            new_initializers.append(eps_tensor)
             
             x_sq, mean_sq, mean_eps, rms, norm = [f"{prefix}{s}" for s in ["x_sq", "mean_sq", "mean_eps", "rms", "norm"]]
             ordered_nodes.extend([
@@ -65,6 +83,7 @@ def decompose_layer_norm(model):
             ordered_nodes.append(node)
 
     if counter > 0:
+        print(f"Decomposed {counter} custom norm nodes with matched data types...")
         del graph.node[:]
         graph.node.extend(ordered_nodes)
         graph.initializer.extend(new_initializers)
@@ -74,7 +93,12 @@ def sanitize_shapes(model, default_seq_len=128):
     """Converts dynamic ONNX shapes to static dimensions for Hexagon NPU."""
     graph = model.graph
     input_specs = {}
-    dtype_map = {TensorProto.FLOAT: "float32", TensorProto.FLOAT16: "float16", TensorProto.INT64: "int64", TensorProto.INT32: "int32"}
+    dtype_map = {
+        TensorProto.FLOAT: "float32", 
+        TensorProto.FLOAT16: "float16", 
+        TensorProto.INT64: "int64", 
+        TensorProto.INT32: "int32"
+    }
 
     for input_tensor in graph.input:
         t_type = input_tensor.type.tensor_type
@@ -120,8 +144,6 @@ def main():
     if data_filename:
         print(f"Downloading '{data_filename}'...")
         cached_data = hf_hub_download(repo_id=repo_id, filename=data_filename, token=hf_token)
-        
-        # Resolve symlink to get actual physical file path
         real_cached_data = os.path.realpath(cached_data)
         
         old_data_name = os.path.basename(data_filename)

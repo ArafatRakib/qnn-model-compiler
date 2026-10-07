@@ -3,14 +3,18 @@ name: Compile NPU Context Binary
 on:
   workflow_dispatch:
     inputs:
-      onnx_url:
-        description: 'Direct URL to main .onnx file'
+      hf_repo:
+        description: 'HuggingFace Repository ID'
         required: true
-        default: 'https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx'
-      onnx_data_url:
-        description: 'Direct URL to .onnx_data file (optional/for large models)'
+        default: 'onnx-community/Qwen2.5-Coder-3B-Instruct'
+      hf_model_file:
+        description: 'Relative path to main .onnx file in repo'
+        required: true
+        default: 'onnx/model_q4.onnx'
+      hf_data_file:
+        description: 'Relative path to .onnx_data file in repo'
         required: false
-        default: 'https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx_data'
+        default: 'onnx/model_q4.onnx_data'
 
 jobs:
   qualcomm-build:
@@ -28,7 +32,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install qai-hub onnx
+          pip install qai-hub onnx huggingface_hub
 
       - name: Configure Qualcomm AI Hub Credentials
         env:
@@ -36,17 +40,11 @@ jobs:
         run: |
           qai-hub configure --api_token $QAI_HUB_TOKEN
 
-      - name: Download ONNX Model Files
-        run: |
-          echo "Downloading main ONNX file from: ${{ github.event.inputs.onnx_url }}"
-          wget -O model.onnx "${{ github.event.inputs.onnx_url }}"
-
-          if [ -n "${{ github.event.inputs.onnx_data_url }}" ]; then
-            echo "Downloading ONNX weight data file from: ${{ github.event.inputs.onnx_data_url }}"
-            wget -O model.onnx_data "${{ github.event.inputs.onnx_data_url }}"
-          fi
-
       - name: Run Qualcomm AI Hub Compiler
+        env:
+          HF_REPO_ID: ${{ github.event.inputs.hf_repo }}
+          HF_MODEL_FILE: ${{ github.event.inputs.hf_model_file }}
+          HF_DATA_FILE: ${{ github.event.inputs.hf_data_file }}
         run: |
           python compile.py
 

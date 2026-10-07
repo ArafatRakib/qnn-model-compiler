@@ -18,7 +18,7 @@ def get_target_device():
     print("Fetching device catalog from Qualcomm AI Hub...")
     all_devices = hub.get_devices()
     
-    # Galaxy S25 / Snapdragon 8 Elite target represents current-gen Hexagon NPU architecture (SM8750 / SM8735)
+    # Galaxy S25 / Snapdragon 8 Elite target matches Snapdragon 8s Gen 4 NPU architecture (SM8750 / SM8735)
     for dev in all_devices:
         dev_str = f"{dev.name} {dev.attributes}".lower()
         if any(k in dev_str for k in ["s25", "8 elite", "8elite", "sm8750", "sm8735"]):
@@ -40,16 +40,21 @@ def get_tensor_elem_type(graph, tensor_name):
     for info in list(graph.value_info) + list(graph.input) + list(graph.output):
         if info.name == tensor_name and info.type.HasField("tensor_type"):
             return info.type.tensor_type.elem_type
-    return TensorProto.FLOAT  # Default to float32 if unspecified
+    return TensorProto.FLOAT
 
-def decompose_layer_norm(model):
-    """Replaces custom LayerNorm/RMSNorm with standard ONNX math ops using matching data types."""
+def decompose_custom_nodes(model):
+    """
+    Decomposes com.microsoft:SimplifiedLayerNormalization, com.microsoft:RMSNorm,
+    and com.microsoft:RotaryEmbedding into standard ONNX operators in-place.
+    """
     graph = model.graph
     ordered_nodes = []
     new_initializers = []
-    counter = 0
+    norm_counter = 0
+    rope_counter = 0
 
     for node in graph.node:
+        # 1. Decompose Custom LayerNorm / RMSNorm
         if node.op_type in ["SimplifiedLayerNormalization", "RMSNorm"]:
             x_input, w_input, y_output = node.input[0], node.input[1], node.output[0]
             epsilon, axis = 1e-5, -1
@@ -59,34 +64,109 @@ def decompose_layer_norm(model):
                 elif attr.name == "axis": 
                     axis = attr.i
             
-            # Match epsilon data type dynamically to the scale parameter (w_input)
             elem_type = get_tensor_elem_type(graph, w_input)
-            
-            prefix = f"sln_decomp_{counter}_"
-            counter += 1
+            prefix = f"norm_decomp_{norm_counter}_"
+            norm_counter += 1
             eps_name = prefix + "eps"
             
-            # Create epsilon matching tensor precision (FLOAT vs FLOAT16)
             eps_tensor = helper.make_tensor(eps_name, elem_type, [], [epsilon])
             new_initializers.append(eps_tensor)
             
             x_sq, mean_sq, mean_eps, rms, norm = [f"{prefix}{s}" for s in ["x_sq", "mean_sq", "mean_eps", "rms", "norm"]]
             ordered_nodes.extend([
-                helper.make_node("Mul", [x_input, x_input], [x_sq]),
-                helper.make_node("ReduceMean", [x_sq], [mean_sq], axes=[axis], keepdims=1),
-                helper.make_node("Add", [mean_sq, eps_name], [mean_eps]),
-                helper.make_node("Sqrt", [mean_eps], [rms]),
-                helper.make_node("Div", [x_input, rms], [norm]),
-                helper.make_node("Mul", [norm, w_input], [y_output])
+                helper.make_node("Mul", [x_input, x_input], [x_sq], name=prefix+"mul_sq"),
+                helper.make_node("ReduceMean", [x_sq], [mean_sq], axes=[axis], keepdims=1, name=prefix+"red_mean"),
+                helper.make_node("Add", [mean_sq, eps_name], [mean_eps], name=prefix+"add_eps"),
+                helper.make_node("Sqrt", [mean_eps], [rms], name=prefix+"sqrt"),
+                helper.make_node("Div", [x_input, rms], [norm], name=prefix+"div"),
+                helper.make_node("Mul", [norm, w_input], [y_output], name=prefix+"mul_w")
             ])
+
+        # 2. Decompose Custom RotaryEmbedding (RoPE)
+        elif node.op_type == "RotaryEmbedding":
+            x_input = node.input[0]
+            y_output = node.output[0]
+            prefix = f"rope_decomp_{rope_counter}_"
+            rope_counter += 1
+            
+            rope_nodes = []
+            
+            # Extract cos and sin inputs or gather them using position_ids
+            if len(node.input) >= 4:
+                pos_ids = node.input[1]
+                cos_cache = node.input[2]
+                sin_cache = node.input[3]
+                
+                cos_gathered = prefix + "cos_g"
+                sin_gathered = prefix + "sin_g"
+                
+                node_gather_cos = helper.make_node("Gather", inputs=[cos_cache, pos_ids], outputs=[cos_gathered], axis=0, name=prefix+"gather_cos")
+                node_gather_sin = helper.make_node("Gather", inputs=[sin_cache, pos_ids], outputs=[sin_gathered], axis=0, name=prefix+"gather_sin")
+                
+                axes_unsq_name = prefix + "unsq_axes"
+                new_initializers.append(helper.make_tensor(axes_unsq_name, TensorProto.INT64, [1], [2]))
+                
+                cos_unsq = prefix + "cos_unsq"
+                sin_unsq = prefix + "sin_unsq"
+                node_unsq_cos = helper.make_node("Unsqueeze", inputs=[cos_gathered, axes_unsq_name], outputs=[cos_unsq], name=prefix+"unsq_cos")
+                node_unsq_sin = helper.make_node("Unsqueeze", inputs=[sin_gathered, axes_unsq_name], outputs=[sin_unsq], name=prefix+"unsq_sin")
+                
+                cos_input = cos_unsq
+                sin_input = sin_unsq
+                rope_nodes.extend([node_gather_cos, node_gather_sin, node_unsq_cos, node_unsq_sin])
+            elif len(node.input) == 3:
+                cos_input = node.input[1]
+                sin_input = node.input[2]
+            else:
+                ordered_nodes.append(node)
+                continue
+
+            rotary_dim = 128
+            for attr in node.attribute:
+                if attr.name == "rotary_embedding_dim" and attr.i > 0:
+                    rotary_dim = attr.i
+
+            half_dim = rotary_dim // 2
+
+            # Slicing initializers
+            init_s0 = prefix + "s0"
+            init_e_half = prefix + "e_half"
+            init_s_half = prefix + "s_half"
+            init_e_max = prefix + "e_max"
+            init_axes = prefix + "axes"
+
+            new_initializers.extend([
+                helper.make_tensor(init_s0, TensorProto.INT64, [1], [0]),
+                helper.make_tensor(init_e_half, TensorProto.INT64, [1], [half_dim]),
+                helper.make_tensor(init_s_half, TensorProto.INT64, [1], [half_dim]),
+                helper.make_tensor(init_e_max, TensorProto.INT64, [1], [2147483647]),
+                helper.make_tensor(init_axes, TensorProto.INT64, [1], [-1]),
+            ])
+
+            x1, x2 = prefix + "x1", prefix + "x2"
+            neg_x2, x_rot = prefix + "neg_x2", prefix + "x_rot"
+            x_cos, x_rot_sin = prefix + "x_cos", prefix + "x_rot_sin"
+
+            # Construct RoPE math: Y = (X * cos) + (Concat(-X2, X1) * sin)
+            node_slice1 = helper.make_node("Slice", inputs=[x_input, init_s0, init_e_half, init_axes], outputs=[x1], name=prefix+"slice1")
+            node_slice2 = helper.make_node("Slice", inputs=[x_input, init_s_half, init_e_max, init_axes], outputs=[x2], name=prefix+"slice2")
+            node_neg = helper.make_node("Neg", inputs=[x2], outputs=[neg_x2], name=prefix+"neg")
+            node_concat = helper.make_node("Concat", inputs=[neg_x2, x1], outputs=[x_rot], axis=-1, name=prefix+"concat")
+            node_mul_cos = helper.make_node("Mul", inputs=[x_input, cos_input], outputs=[x_cos], name=prefix+"mul_cos")
+            node_mul_sin = helper.make_node("Mul", inputs=[x_rot, sin_input], outputs=[x_rot_sin], name=prefix+"mul_sin")
+            node_add = helper.make_node("Add", inputs=[x_cos, x_rot_sin], outputs=[y_output], name=prefix+"add")
+
+            rope_nodes.extend([node_slice1, node_slice2, node_neg, node_concat, node_mul_cos, node_mul_sin, node_add])
+            ordered_nodes.extend(rope_nodes)
         else:
             ordered_nodes.append(node)
 
-    if counter > 0:
-        print(f"Decomposed {counter} custom norm nodes with matched data types...")
+    if norm_counter > 0 or rope_counter > 0:
+        print(f"Decomposed {norm_counter} norm nodes and {rope_counter} RoPE nodes into standard ONNX operators...")
         del graph.node[:]
         graph.node.extend(ordered_nodes)
         graph.initializer.extend(new_initializers)
+        
     return model
 
 def sanitize_shapes(model, default_seq_len=128):
@@ -161,7 +241,7 @@ def main():
                 if ext.key == "location" and ext.value == old_data_name:
                     ext.value = new_data_name
 
-    onnx_model = decompose_layer_norm(onnx_model)
+    onnx_model = decompose_custom_nodes(onnx_model)
     onnx_model, input_specs = sanitize_shapes(onnx_model, default_seq_len=seq_len)
 
     onnx.save(onnx_model, staged_onnx_path)

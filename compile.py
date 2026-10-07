@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import qai_hub as hub
 from huggingface_hub import hf_hub_download
 
@@ -10,11 +11,6 @@ def clean_repo_id(repo_input):
         if repo.startswith(prefix):
             repo = repo[len(prefix):]
     return repo.strip("/")
-
-def download_hf_file(repo_id, filename):
-    print(f"Downloading '{filename}' from HuggingFace repo '{repo_id}'...")
-    file_path = hf_hub_download(repo_id=repo_id, filename=filename)
-    return file_path
 
 def get_target_device():
     print("Fetching device catalog from Qualcomm AI Hub...")
@@ -41,22 +37,30 @@ def main():
     model_filename = os.environ.get("HF_MODEL_FILE", "onnx/model_q4.onnx")
     data_filename = os.environ.get("HF_DATA_FILE", "onnx/model_q4.onnx_data")
 
-    # 1. Download ONNX model graph structure
-    model_local_path = download_hf_file(repo_id, model_filename)
+    # 1. Create a clean local staging directory
+    staging_dir = "./model_staging"
+    os.makedirs(staging_dir, exist_ok=True)
 
-    # 2. Download ONNX weight data if required
+    # 2. Download and copy ONNX graph file
+    print(f"Downloading '{model_filename}' from Hugging Face...")
+    cached_onnx = hf_hub_download(repo_id=repo_id, filename=model_filename)
+    local_onnx = os.path.join(staging_dir, os.path.basename(model_filename))
+    shutil.copyfile(cached_onnx, local_onnx)
+
+    # 3. Download and copy external weights file
     if data_filename:
-        try:
-            download_hf_file(repo_id, data_filename)
-        except Exception as e:
-            print(f"Notice: Separate weight file not fetched or not required ({e})")
+        print(f"Downloading '{data_filename}' from Hugging Face...")
+        cached_data = hf_hub_download(repo_id=repo_id, filename=data_filename)
+        local_data = os.path.join(staging_dir, os.path.basename(data_filename))
+        shutil.copyfile(cached_data, local_data)
 
     target_device = get_target_device()
 
     print(f"\nSubmitting ONNX model to Qualcomm AI Hub for {target_device.name} compilation...")
     
+    # Submit job using the staged regular files
     compile_job = hub.submit_compile_job(
-        model=model_local_path,
+        model=local_onnx,
         device=target_device,
         options="--target_runtime precompiled_qnn_onnx"
     )

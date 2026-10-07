@@ -1,61 +1,53 @@
 import os
 import sys
 import qai_hub as hub
+from huggingface_hub import hf_hub_download
+
+def download_hf_file(repo_id, filename):
+    print(f"Downloading '{filename}' from HuggingFace repo '{repo_id}'...")
+    # hf_hub_download handles Git LFS binaries and redirects automatically
+    file_path = hf_hub_download(repo_id=repo_id, filename=filename)
+    return file_path
 
 def get_target_device():
-    print("Fetching live device catalog from Qualcomm AI Hub...")
+    print("Fetching device catalog from Qualcomm AI Hub...")
     all_devices = hub.get_devices()
     
-    snapdragon_devices = []
-    print("Available Snapdragon candidates in AI Hub pool:")
+    # Target modern Snapdragon 8-series / S25 targets
     for dev in all_devices:
-        dev_info = f"{dev.name} {dev.attributes}".lower()
-        # Filter for Snapdragon 8 series and modern flagships
-        if any(k in dev_info for k in ["snapdragon", "s25", "s24", "s23", "8elite", "8gen", "sm8"]):
-            snapdragon_devices.append(dev)
-            print(f" - Found: '{dev.name}' | Attributes: {dev.attributes}")
+        dev_str = f"{dev.name} {dev.attributes}".lower()
+        if any(k in dev_str for k in ["s25", "8 elite", "8elite", "sm8750", "sm8735"]):
+            print(f"Selected target device: '{dev.name}'")
+            return dev
 
-    if not snapdragon_devices:
-        print("Warning: No specific Snapdragon 8-series matched. Defaulting to first available device.")
-        return all_devices[0]
+    for dev in all_devices:
+        if "snapdragon" in dev.name.lower() or "s24" in dev.name.lower():
+            print(f"Fallback target device: '{dev.name}'")
+            return dev
 
-    # Priority matching order (from newest generation down)
-    priority_keywords = [
-        "8 elite",
-        "8elite",
-        "sm8750",
-        "sm8735",
-        "s25",
-        "s24",
-        "8gen3",
-        "snapdragon 8"
-    ]
-
-    for kw in priority_keywords:
-        for dev in snapdragon_devices:
-            dev_info = f"{dev.name} {dev.attributes}".lower()
-            if kw in dev_info:
-                print(f"\nSuccessfully selected target device: '{dev.name}'")
-                return dev
-
-    # Fallback to first available Snapdragon device
-    selected = snapdragon_devices[0]
-    print(f"\nFallback selected device: '{selected.name}'")
-    return selected
+    return all_devices[0]
 
 def main():
-    target_device = get_target_device()
+    repo_id = os.environ.get("HF_REPO_ID", "onnx-community/Qwen2.5-Coder-3B-Instruct")
+    model_filename = os.environ.get("HF_MODEL_FILE", "onnx/model_q4.onnx")
+    data_filename = os.environ.get("HF_DATA_FILE", "onnx/model_q4.onnx_data")
 
-    model_path = "model.onnx"
-    if not os.path.exists(model_path):
-        print(f"Error: {model_path} not found.")
-        sys.exit(1)
+    # 1. Download ONNX model graph structure
+    model_local_path = download_hf_file(repo_id, model_filename)
+
+    # 2. Download ONNX weight data if required
+    if data_filename:
+        try:
+            download_hf_file(repo_id, data_filename)
+        except Exception as e:
+            print(f"Notice: Separate weight file not fetched or not required ({e})")
+
+    target_device = get_target_device()
 
     print(f"\nSubmitting ONNX model to Qualcomm AI Hub for {target_device.name} compilation...")
     
-    # Submit compile job with 'precompiled_qnn_onnx' target runtime for ONNX graphs
     compile_job = hub.submit_compile_job(
-        model=model_path,
+        model=model_local_path,
         device=target_device,
         options="--target_runtime precompiled_qnn_onnx"
     )

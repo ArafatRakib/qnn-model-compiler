@@ -2,6 +2,15 @@ name: Compile NPU Context Binary
 
 on:
   workflow_dispatch:
+    inputs:
+      onnx_url:
+        description: 'Direct URL to main .onnx file'
+        required: true
+        default: 'https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx'
+      onnx_data_url:
+        description: 'Direct URL to .onnx_data file (optional/for large models)'
+        required: false
+        default: 'https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx_data'
 
 jobs:
   qualcomm-build:
@@ -27,13 +36,15 @@ jobs:
         run: |
           qai-hub configure --api_token $QAI_HUB_TOKEN
 
-      - name: Download Q4 ONNX Model & Data Files
+      - name: Download ONNX Model Files
         run: |
-          echo "Downloading Q4 ONNX Model structure..."
-          wget -O model.onnx "https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx"
-          
-          echo "Downloading Q4 ONNX Weight data..."
-          wget -O model.onnx_data "https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx_data"
+          echo "Downloading main ONNX file from: ${{ github.event.inputs.onnx_url }}"
+          wget -O model.onnx "${{ github.event.inputs.onnx_url }}"
+
+          if [ -n "${{ github.event.inputs.onnx_data_url }}" ]; then
+            echo "Downloading ONNX weight data file from: ${{ github.event.inputs.onnx_data_url }}"
+            wget -O model.onnx_data "${{ github.event.inputs.onnx_data_url }}"
+          fi
 
       - name: Run Qualcomm AI Hub Compiler
         run: |
@@ -42,5 +53,5 @@ jobs:
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qwen-coder-3b-qnn-onnx
+          name: qwen-coder-qnn-onnx
           path: qwen_coder_qnn.onnx

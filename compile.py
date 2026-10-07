@@ -1,7 +1,9 @@
 import os
 import sys
 import shutil
+import numpy as np
 import onnx
+from onnx import helper, TensorProto
 import qai_hub as hub
 from huggingface_hub import hf_hub_download
 
@@ -17,7 +19,7 @@ def get_target_device():
     print("Fetching device catalog from Qualcomm AI Hub...")
     all_devices = hub.get_devices()
     
-    # Target modern Snapdragon 8-series / S25 targets
+    # Target modern Snapdragon 8-series / S25 targets (Snapdragon 8 Elite / 8s Gen 4 generation)
     for dev in all_devices:
         dev_str = f"{dev.name} {dev.attributes}".lower()
         if any(k in dev_str for k in ["s25", "8 elite", "8elite", "sm8750", "sm8735"]):
@@ -30,6 +32,90 @@ def get_target_device():
             return dev
 
     return all_devices[0]
+
+def get_tensor_elem_type(graph, tensor_name):
+    """Find data element type of a tensor from value_info, input, or output."""
+    for info in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if info.name == tensor_name and info.type.HasField("tensor_type"):
+            return info.type.tensor_type.elem_type
+    return TensorProto.FLOAT16  # Default fallback for quantized models
+
+def decompose_simplified_layer_norm(model):
+    """Decompose com.microsoft:SimplifiedLayerNormalization into standard ONNX ops."""
+    graph = model.graph
+    nodes_to_remove = []
+    new_nodes = []
+    new_initializers = []
+    counter = 0
+
+    for node in graph.node:
+        if node.op_type == "SimplifiedLayerNormalization":
+            nodes_to_remove.append(node)
+            
+            x_input = node.input[0]
+            w_input = node.input[1]
+            y_output = node.output[0]
+            
+            # Extract attributes
+            epsilon = 1e-5
+            axis = -1
+            for attr in node.attribute:
+                if attr.name == "epsilon":
+                    epsilon = attr.f
+                elif attr.name == "axis":
+                    axis = attr.i
+            
+            elem_type = get_tensor_elem_type(graph, x_input)
+            prefix = f"sln_decomp_{counter}_"
+            counter += 1
+            
+            # Epsilon constant initializer
+            eps_name = prefix + "eps"
+            eps_tensor = helper.make_tensor(
+                name=eps_name,
+                data_type=elem_type,
+                dims=[],
+                vals=[epsilon]
+            )
+            new_initializers.append(eps_tensor)
+            
+            # Intermediate tensor names
+            x_sq = prefix + "x_sq"
+            mean_sq = prefix + "mean_sq"
+            mean_eps = prefix + "mean_eps"
+            rms = prefix + "rms"
+            norm = prefix + "norm"
+            
+            # 1. Mul(X, X) -> x_sq
+            node_mul_sq = helper.make_node("Mul", inputs=[x_input, x_input], outputs=[x_sq], name=prefix+"mul_sq")
+            
+            # 2. ReduceMean(x_sq, axes=[axis], keepdims=1) -> mean_sq
+            node_red = helper.make_node("ReduceMean", inputs=[x_sq], outputs=[mean_sq], axes=[axis], keepdims=1, name=prefix+"red_mean")
+            
+            # 3. Add(mean_sq, eps) -> mean_eps
+            node_add = helper.make_node("Add", inputs=[mean_sq, eps_name], outputs=[mean_eps], name=prefix+"add_eps")
+            
+            # 4. Sqrt(mean_eps) -> rms
+            node_sqrt = helper.make_node("Sqrt", inputs=[mean_eps], outputs=[rms], name=prefix+"sqrt")
+            
+            # 5. Div(X, rms) -> norm
+            node_div = helper.make_node("Div", inputs=[x_input, rms], outputs=[norm], name=prefix+"div")
+            
+            # 6. Mul(norm, W) -> Y
+            node_mul_w = helper.make_node("Mul", inputs=[norm, w_input], outputs=[y_output], name=prefix+"mul_w")
+            
+            new_nodes.extend([node_mul_sq, node_red, node_add, node_sqrt, node_div, node_mul_w])
+
+    if nodes_to_remove:
+        print(f"Decomposing {len(nodes_to_remove)} 'SimplifiedLayerNormalization' nodes into standard ONNX operators...")
+        for n in nodes_to_remove:
+            graph.node.remove(n)
+        graph.node.extend(new_nodes)
+        graph.initializer.extend(new_initializers)
+    else:
+        print("No 'SimplifiedLayerNormalization' nodes found to decompose.")
+        
+    return model
 
 def main():
     raw_repo_id = os.environ.get("HF_REPO_ID", "onnx-community/Qwen2.5-Coder-3B-Instruct")
@@ -44,18 +130,19 @@ def main():
         shutil.rmtree(staging_dir)
     os.makedirs(staging_dir, exist_ok=True)
 
-    # 2. Download ONNX graph file from Hugging Face
+    # 2. Download ONNX graph file
     print(f"Downloading '{model_filename}' from Hugging Face...")
     cached_onnx = hf_hub_download(repo_id=repo_id, filename=model_filename)
     staged_onnx_path = os.path.join(staging_dir, os.path.basename(model_filename))
 
-    # 3. Handle external weights file and convert extension to .data
+    # 3. Handle external weights and adjust file extension to .data
+    old_data_name = ""
+    new_data_name = ""
     if data_filename:
         print(f"Downloading '{data_filename}' from Hugging Face...")
         cached_data = hf_hub_download(repo_id=repo_id, filename=data_filename)
         
         old_data_name = os.path.basename(data_filename)
-        # Convert extension from .onnx_data to .data for qai_hub compliance
         if old_data_name.endswith(".onnx_data"):
             new_data_name = old_data_name[:-10] + ".data"
         elif not old_data_name.endswith(".data"):
@@ -66,26 +153,24 @@ def main():
         staged_data_path = os.path.join(staging_dir, new_data_name)
         shutil.copyfile(cached_data, staged_data_path)
 
-        # Update ONNX graph protobuf to point to the renamed .data weight file
-        print(f"Updating ONNX external data pointers from '{old_data_name}' to '{new_data_name}'...")
-        onnx_model = onnx.load(cached_onnx, load_external_data=False)
+    # 4. Load graph structure (load_external_data=False keeps 2GB weights off RAM)
+    print("Loading ONNX model graph structure...")
+    onnx_model = onnx.load(cached_onnx, load_external_data=False)
 
-        def fix_external_data_pointers(graph):
-            for init in graph.initializer:
-                for ext in init.external_data:
-                    if ext.key == "location" and ext.value == old_data_name:
-                        ext.value = new_data_name
-            for node in graph.node:
-                for attr in node.attribute:
-                    if attr.HasField("g"):
-                        fix_external_data_pointers(attr.g)
-                    for g in attr.graphs:
-                        fix_external_data_pointers(g)
+    # 5. Fix external weights pointers if renamed
+    if old_data_name and new_data_name and old_data_name != new_data_name:
+        print(f"Updating ONNX external weight pointers from '{old_data_name}' to '{new_data_name}'...")
+        for init in onnx_model.graph.initializer:
+            for ext in init.external_data:
+                if ext.key == "location" and ext.value == old_data_name:
+                    ext.value = new_data_name
 
-        fix_external_data_pointers(onnx_model.graph)
-        onnx.save(onnx_model, staged_onnx_path, save_as_external_data=False)
-    else:
-        shutil.copyfile(cached_onnx, staged_onnx_path)
+    # 6. Decompose non-standard SimplifiedLayerNormalization nodes
+    onnx_model = decompose_simplified_layer_norm(onnx_model)
+
+    # 7. Save updated model back to staging directory
+    print(f"Saving modified ONNX model to '{staged_onnx_path}'...")
+    onnx.save(onnx_model, staged_onnx_path)
 
     target_device = get_target_device()
 

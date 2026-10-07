@@ -37,30 +37,30 @@ def main():
     model_filename = os.environ.get("HF_MODEL_FILE", "onnx/model_q4.onnx")
     data_filename = os.environ.get("HF_DATA_FILE", "onnx/model_q4.onnx_data")
 
-    # 1. Create a clean local staging directory
-    staging_dir = "./model_staging"
+    # 1. Create directory ending with .onnx required by Qualcomm AI Hub for external weights
+    staging_dir = "./qwen_q4.onnx"
+    if os.path.exists(staging_dir):
+        shutil.rmtree(staging_dir)
     os.makedirs(staging_dir, exist_ok=True)
 
-    # 2. Download and copy ONNX graph file
+    # 2. Download and copy ONNX graph file into staging directory
     print(f"Downloading '{model_filename}' from Hugging Face...")
     cached_onnx = hf_hub_download(repo_id=repo_id, filename=model_filename)
-    local_onnx = os.path.join(staging_dir, os.path.basename(model_filename))
-    shutil.copyfile(cached_onnx, local_onnx)
+    shutil.copyfile(cached_onnx, os.path.join(staging_dir, os.path.basename(model_filename)))
 
-    # 3. Download and copy external weights file
+    # 3. Download and copy external weights file into the SAME staging directory
     if data_filename:
         print(f"Downloading '{data_filename}' from Hugging Face...")
         cached_data = hf_hub_download(repo_id=repo_id, filename=data_filename)
-        local_data = os.path.join(staging_dir, os.path.basename(data_filename))
-        shutil.copyfile(cached_data, local_data)
+        shutil.copyfile(cached_data, os.path.join(staging_dir, os.path.basename(data_filename)))
 
     target_device = get_target_device()
 
-    print(f"\nSubmitting ONNX model to Qualcomm AI Hub for {target_device.name} compilation...")
+    print(f"\nSubmitting ONNX model directory '{staging_dir}' to Qualcomm AI Hub for {target_device.name} compilation...")
     
-    # Submit job using the staged regular files
+    # Pass the staging DIRECTORY path so qai_hub uploads both model_q4.onnx and model_q4.onnx_data
     compile_job = hub.submit_compile_job(
-        model=local_onnx,
+        model=staging_dir,
         device=target_device,
         options="--target_runtime precompiled_qnn_onnx"
     )

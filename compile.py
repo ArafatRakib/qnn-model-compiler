@@ -3,13 +3,6 @@ import sys
 import qai_hub as hub
 
 def main():
-    token = os.environ.get("QAI_HUB_TOKEN")
-    if not token:
-        print("Error: QAI_HUB_TOKEN environment variable not found.")
-        sys.exit(1)
-
-    hub.configure(api_token=token)
-
     # Target Snapdragon 8s Gen 4 Hexagon NPU specifically
     try:
         device = hub.Device("Snapdragon 8s Gen 4")

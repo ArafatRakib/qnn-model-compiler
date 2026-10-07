@@ -2,11 +2,6 @@ name: Compile NPU Context Binary
 
 on:
   workflow_dispatch:
-    inputs:
-      onnx_url:
-        description: 'Direct URL to ONNX model'
-        required: true
-        default: 'https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-ONNX/resolve/main/model.onnx'
 
 jobs:
   qualcomm-build:
@@ -32,10 +27,13 @@ jobs:
         run: |
           qai-hub configure --api_token $QAI_HUB_TOKEN
 
-      - name: Download ONNX Model File
+      - name: Download Q4 ONNX Model & Data Files
         run: |
-          echo "Downloading model from: ${{ github.event.inputs.onnx_url }}"
-          wget -O model.onnx "${{ github.event.inputs.onnx_url }}"
+          echo "Downloading Q4 ONNX Model structure..."
+          wget -O model.onnx "https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx"
+          
+          echo "Downloading Q4 ONNX Weight data..."
+          wget -O model.onnx_data "https://huggingface.co/onnx-community/Qwen2.5-Coder-3B-Instruct/resolve/main/onnx/model_q4.onnx_data"
 
       - name: Run Qualcomm AI Hub Compiler
         run: |
@@ -44,5 +42,5 @@ jobs:
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qwen-coder-qnn-onnx
+          name: qwen-coder-3b-qnn-onnx
           path: qwen_coder_qnn.onnx

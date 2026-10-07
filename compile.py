@@ -17,11 +17,19 @@ def clean_repo_id(repo_input):
 def get_target_device():
     print("Fetching device catalog from Qualcomm AI Hub...")
     all_devices = hub.get_devices()
+    
+    # Galaxy S25 / Snapdragon 8 Elite target represents current-gen Hexagon NPU architecture (SM8750 / SM8735)
     for dev in all_devices:
         dev_str = f"{dev.name} {dev.attributes}".lower()
         if any(k in dev_str for k in ["s25", "8 elite", "8elite", "sm8750", "sm8735"]):
-            print(f"Selected target device: '{dev.name}'")
+            print(f"Selected Qualcomm AI Hub cloud target: '{dev.name}' (Architecture match for Snapdragon 8s Gen 4)")
             return dev
+
+    for dev in all_devices:
+        if "snapdragon" in dev.name.lower() or "s24" in dev.name.lower():
+            print(f"Fallback target device: '{dev.name}'")
+            return dev
+
     return all_devices[0]
 
 def decompose_layer_norm(model):
@@ -100,7 +108,8 @@ def main():
     seq_len = int(os.environ.get("MODEL_SEQ_LEN", "128"))
 
     staging_dir = "./qwen_model.onnx"
-    if os.path.exists(staging_dir): shutil.rmtree(staging_dir)
+    if os.path.exists(staging_dir): 
+        shutil.rmtree(staging_dir)
     os.makedirs(staging_dir, exist_ok=True)
 
     print(f"Downloading '{model_filename}'...")
@@ -111,9 +120,16 @@ def main():
     if data_filename:
         print(f"Downloading '{data_filename}'...")
         cached_data = hf_hub_download(repo_id=repo_id, filename=data_filename, token=hf_token)
+        
+        # Resolve symlink to get actual physical file path
+        real_cached_data = os.path.realpath(cached_data)
+        
         old_data_name = os.path.basename(data_filename)
         new_data_name = old_data_name[:-10] + ".data" if old_data_name.endswith(".onnx_data") else old_data_name
-        shutil.move(cached_data, os.path.join(staging_dir, new_data_name))
+        
+        staged_data_path = os.path.join(staging_dir, new_data_name)
+        print(f"Copying real binary file to '{staged_data_path}'...")
+        shutil.copyfile(real_cached_data, staged_data_path)
 
     onnx_model = onnx.load(cached_onnx, load_external_data=False)
 

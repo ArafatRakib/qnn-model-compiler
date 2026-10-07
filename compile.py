@@ -44,6 +44,9 @@ def get_tensor_elem_type(graph, tensor_name):
 
 def get_tensor_shape(graph, tensor_name):
     """Extract dimension shape list for a given tensor."""
+    for init in graph.initializer:
+        if init.name == tensor_name:
+            return [d for d in init.dims]
     for info in list(graph.value_info) + list(graph.input) + list(graph.output):
         if info.name == tensor_name and info.type.HasField("tensor_type"):
             shape = []
@@ -53,7 +56,7 @@ def get_tensor_shape(graph, tensor_name):
                 else:
                     shape.append(128)
             return shape
-    return [1, 16, 128, 128]
+    return []
 
 def decompose_custom_nodes(model):
     """
@@ -115,10 +118,7 @@ def decompose_custom_nodes(model):
                 node_gather_cos = helper.make_node("Gather", inputs=[cos_cache, pos_ids], outputs=[cos_gathered], axis=0, name=prefix+"gather_cos")
                 node_gather_sin = helper.make_node("Gather", inputs=[sin_cache, pos_ids], outputs=[sin_gathered], axis=0, name=prefix+"gather_sin")
                 
-                # Inspect tensor shape to select the correct unsqueeze axis
                 x_shape = get_tensor_shape(graph, x_input)
-                # If layout is [batch, num_heads, seq_len, head_dim], unsqueeze at axis 1 -> [batch, 1, seq_len, head_dim]
-                # If layout is [batch, seq_len, num_heads, head_dim], unsqueeze at axis 2 -> [batch, seq_len, 1, head_dim]
                 unsq_axis = 1 if len(x_shape) == 4 and x_shape[1] < x_shape[2] else 2
                 
                 axes_unsq_name = prefix + "unsq_axes"
@@ -129,12 +129,17 @@ def decompose_custom_nodes(model):
                 node_unsq_cos = helper.make_node("Unsqueeze", inputs=[cos_gathered, axes_unsq_name], outputs=[cos_unsq], name=prefix+"unsq_cos")
                 node_unsq_sin = helper.make_node("Unsqueeze", inputs=[sin_gathered, axes_unsq_name], outputs=[sin_unsq], name=prefix+"unsq_sin")
                 
-                cos_input = cos_unsq
-                sin_input = sin_unsq
                 rope_nodes.extend([node_gather_cos, node_gather_sin, node_unsq_cos, node_unsq_sin])
+                
+                cos_raw = cos_unsq
+                sin_raw = sin_unsq
+                cos_cache_shape = get_tensor_shape(graph, cos_cache)
+                cos_last_dim = cos_cache_shape[-1] if cos_cache_shape else 64
             elif len(node.input) == 3:
-                cos_input = node.input[1]
-                sin_input = node.input[2]
+                cos_raw = node.input[1]
+                sin_raw = node.input[2]
+                cos_raw_shape = get_tensor_shape(graph, cos_raw)
+                cos_last_dim = cos_raw_shape[-1] if cos_raw_shape else 64
             else:
                 ordered_nodes.append(node)
                 continue
@@ -142,6 +147,17 @@ def decompose_custom_nodes(model):
             x_shape = get_tensor_shape(graph, x_input)
             head_dim = x_shape[-1] if len(x_shape) > 0 and isinstance(x_shape[-1], int) and x_shape[-1] > 0 else 128
             half_dim = head_dim // 2
+
+            # Expand half-dimension cos/sin (64) to full head_dim (128) if needed
+            if cos_last_dim < head_dim:
+                cos_input = prefix + "cos_full"
+                sin_input = prefix + "sin_full"
+                node_cat_cos = helper.make_node("Concat", inputs=[cos_raw, cos_raw], outputs=[cos_input], axis=-1, name=prefix+"cat_cos")
+                node_cat_sin = helper.make_node("Concat", inputs=[sin_raw, sin_raw], outputs=[sin_input], axis=-1, name=prefix+"cat_sin")
+                rope_nodes.extend([node_cat_cos, node_cat_sin])
+            else:
+                cos_input = cos_raw
+                sin_input = sin_raw
 
             # Slicing initializers
             init_s0 = prefix + "s0"
@@ -256,16 +272,23 @@ def main():
                 if ext.key == "location" and ext.value == old_data_name:
                     ext.value = new_data_name
 
+    # First shape inference pass to populate value_info shapes
+    print("Running initial shape inference pass...")
+    try:
+        onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
+    except Exception as e:
+        print(f"Notice during initial shape inference: {e}")
+
     onnx_model = decompose_custom_nodes(onnx_model)
     onnx_model, input_specs = sanitize_shapes(onnx_model, default_seq_len=seq_len)
 
-    # Pre-flight shape inference check
-    print("Running local shape and type inference validation...")
+    # Final shape inference validation pass
+    print("Running final shape and type inference validation...")
     try:
         onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
-        print("Local shape inference validation passed successfully!")
+        print("Final shape inference validation passed successfully!")
     except Exception as e:
-        print(f"Notice during local shape inference: {e}")
+        print(f"Notice during final shape inference: {e}")
 
     onnx.save(onnx_model, staged_onnx_path)
     del onnx_model

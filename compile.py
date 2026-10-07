@@ -226,11 +226,12 @@ def main():
 
     print(f"\nSubmitting static-shape ONNX model directory '{staging_dir}' to Qualcomm AI Hub for {target_device.name} compilation...")
     
+    # Enable --truncate_64bit_io to handle int64 input tensors on Qualcomm Hexagon NPU
     compile_job = hub.submit_compile_job(
         model=staging_dir,
         device=target_device,
         input_specs=input_specs,
-        options="--target_runtime precompiled_qnn_onnx"
+        options="--target_runtime precompiled_qnn_onnx --truncate_64bit_io"
     )
 
     target_model = compile_job.get_target_model()

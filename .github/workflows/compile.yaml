@@ -10,11 +10,11 @@ on:
       hf_model_file:
         description: 'Relative path to main .onnx file in repo'
         required: true
-        default: 'onnx/model_q4.onnx'
+        default: 'onnx/model_int8.onnx'
       hf_data_file:
         description: 'Relative path to .onnx_data file in repo'
         required: false
-        default: 'onnx/model_q4.onnx_data'
+        default: 'onnx/model_int8.onnx_data'
 
 jobs:
   qualcomm-build:
@@ -52,5 +52,5 @@ jobs:
       - name: Upload Binary Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: qwen-coder-qnn-onnx
+          name: qwen-coder-3b-int8-npu
           path: qwen_coder_qnn.onnx

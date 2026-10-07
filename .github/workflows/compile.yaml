@@ -45,6 +45,7 @@ jobs:
           HF_REPO_ID: ${{ github.event.inputs.hf_repo }}
           HF_MODEL_FILE: ${{ github.event.inputs.hf_model_file }}
           HF_DATA_FILE: ${{ github.event.inputs.hf_data_file }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python compile.py
 

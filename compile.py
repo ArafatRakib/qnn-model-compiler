@@ -3,40 +3,45 @@ import sys
 import qai_hub as hub
 
 def get_target_device():
-    # Target same-generation Adreno 800 / Hexagon 8-series targets (Snapdragon 8s Gen 4 / 8 Elite)
-    device_candidates = [
-        "Snapdragon 8s Gen 4",
-        "Snapdragon 8 Elite",
-        "Snapdragon 8 Gen 4"
-    ]
+    print("Fetching live device catalog from Qualcomm AI Hub...")
+    all_devices = hub.get_devices()
     
-    for dev_name in device_candidates:
-        try:
-            devices = hub.get_devices(name=dev_name)
-            if devices:
-                print(f"Selected AI Hub target device: {devices[0].name}")
-                return devices[0]
-        except Exception:
-            continue
+    snapdragon_devices = []
+    print("Available Snapdragon candidates in AI Hub pool:")
+    for dev in all_devices:
+        dev_info = f"{dev.name} {dev.attributes}".lower()
+        # Filter for Snapdragon 8 series and modern flagships
+        if any(k in dev_info for k in ["snapdragon", "s25", "s24", "s23", "8elite", "8gen", "sm8"]):
+            snapdragon_devices.append(dev)
+            print(f" - Found: '{dev.name}' | Attributes: {dev.attributes}")
 
-    # Fallback to same-gen SoC tags (SM8735 for 8s Gen 4, SM8750 for 8 Elite)
-    chipset_tags = [
-        "chipset:qualcomm-sm8735",
-        "chipset:qualcomm-sm8750",
-        "chipset:qualcomm-snapdragon-8-elite"
+    if not snapdragon_devices:
+        print("Warning: No specific Snapdragon 8-series matched. Defaulting to first available device.")
+        return all_devices[0]
+
+    # Priority matching order (from newest generation down)
+    priority_keywords = [
+        "8 elite",
+        "8elite",
+        "sm8750",
+        "sm8735",
+        "s25",
+        "s24",
+        "8gen3",
+        "snapdragon 8"
     ]
-    
-    for tag in chipset_tags:
-        try:
-            devices = hub.get_devices(attributes=[tag])
-            if devices:
-                print(f"Selected AI Hub device via chipset ({tag}): {devices[0].name}")
-                return devices[0]
-        except Exception:
-            continue
 
-    print("Error: Could not locate a valid Snapdragon 8 Elite or 8s Gen 4 target device in AI Hub.")
-    sys.exit(1)
+    for kw in priority_keywords:
+        for dev in snapdragon_devices:
+            dev_info = f"{dev.name} {dev.attributes}".lower()
+            if kw in dev_info:
+                print(f"\nSuccessfully selected target device: '{dev.name}'")
+                return dev
+
+    # Fallback to first available Snapdragon device
+    selected = snapdragon_devices[0]
+    print(f"\nFallback selected device: '{selected.name}'")
+    return selected
 
 def main():
     target_device = get_target_device()
@@ -46,8 +51,9 @@ def main():
         print(f"Error: {model_path} not found.")
         sys.exit(1)
 
-    print(f"Submitting ONNX model to Qualcomm AI Hub for {target_device.name} compilation...")
+    print(f"\nSubmitting ONNX model to Qualcomm AI Hub for {target_device.name} compilation...")
     
+    # Submit compile job with 'precompiled_qnn_onnx' target runtime for ONNX graphs
     compile_job = hub.submit_compile_job(
         model=model_path,
         device=target_device,
@@ -58,7 +64,7 @@ def main():
     output_filename = "qwen_coder_qnn.onnx"
     target_model.download(output_filename)
     
-    print(f"Compilation successful! Saved artifact to {output_filename}")
+    print(f"\nCompilation successful! Saved artifact to {output_filename}")
 
 if __name__ == "__main__":
     main()

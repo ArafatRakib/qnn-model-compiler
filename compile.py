@@ -1,7 +1,6 @@
 import os
 import sys
 import shutil
-import numpy as np
 import onnx
 from onnx import helper, TensorProto
 import qai_hub as hub
@@ -40,18 +39,15 @@ def get_tensor_elem_type(graph, tensor_name):
             return info.type.tensor_type.elem_type
     return TensorProto.FLOAT16  # Default fallback for quantized models
 
-def decompose_simplified_layer_norm(model):
-    """Decompose com.microsoft:SimplifiedLayerNormalization into standard ONNX ops."""
+def decompose_simplified_layer_norm_in_place(model):
+    """Decompose com.microsoft:SimplifiedLayerNormalization into standard ONNX ops in-place."""
     graph = model.graph
-    nodes_to_remove = []
-    new_nodes = []
+    ordered_nodes = []
     new_initializers = []
     counter = 0
 
     for node in graph.node:
         if node.op_type == "SimplifiedLayerNormalization":
-            nodes_to_remove.append(node)
-            
             x_input = node.input[0]
             w_input = node.input[1]
             y_output = node.output[0]
@@ -104,13 +100,15 @@ def decompose_simplified_layer_norm(model):
             # 6. Mul(norm, W) -> Y
             node_mul_w = helper.make_node("Mul", inputs=[norm, w_input], outputs=[y_output], name=prefix+"mul_w")
             
-            new_nodes.extend([node_mul_sq, node_red, node_add, node_sqrt, node_div, node_mul_w])
+            # Insert standard nodes IN-PLACE where SimplifiedLayerNormalization was
+            ordered_nodes.extend([node_mul_sq, node_red, node_add, node_sqrt, node_div, node_mul_w])
+        else:
+            ordered_nodes.append(node)
 
-    if nodes_to_remove:
-        print(f"Decomposing {len(nodes_to_remove)} 'SimplifiedLayerNormalization' nodes into standard ONNX operators...")
-        for n in nodes_to_remove:
-            graph.node.remove(n)
-        graph.node.extend(new_nodes)
+    if counter > 0:
+        print(f"Decomposed {counter} 'SimplifiedLayerNormalization' nodes in-place (topological order preserved)...")
+        del graph.node[:]
+        graph.node.extend(ordered_nodes)
         graph.initializer.extend(new_initializers)
     else:
         print("No 'SimplifiedLayerNormalization' nodes found to decompose.")
@@ -123,6 +121,7 @@ def main():
     
     model_filename = os.environ.get("HF_MODEL_FILE", "onnx/model_q4.onnx")
     data_filename = os.environ.get("HF_DATA_FILE", "onnx/model_q4.onnx_data")
+    hf_token = os.environ.get("HF_TOKEN", None)
 
     # 1. Create directory ending with .onnx required by Qualcomm AI Hub
     staging_dir = "./qwen_q4.onnx"
@@ -130,17 +129,17 @@ def main():
         shutil.rmtree(staging_dir)
     os.makedirs(staging_dir, exist_ok=True)
 
-    # 2. Download ONNX graph file
+    # 2. Download ONNX graph file from Hugging Face
     print(f"Downloading '{model_filename}' from Hugging Face...")
-    cached_onnx = hf_hub_download(repo_id=repo_id, filename=model_filename)
+    cached_onnx = hf_hub_download(repo_id=repo_id, filename=model_filename, token=hf_token)
     staged_onnx_path = os.path.join(staging_dir, os.path.basename(model_filename))
 
-    # 3. Handle external weights and adjust file extension to .data
+    # 3. Handle external weights file and adjust extension to .data
     old_data_name = ""
     new_data_name = ""
     if data_filename:
         print(f"Downloading '{data_filename}' from Hugging Face...")
-        cached_data = hf_hub_download(repo_id=repo_id, filename=data_filename)
+        cached_data = hf_hub_download(repo_id=repo_id, filename=data_filename, token=hf_token)
         
         old_data_name = os.path.basename(data_filename)
         if old_data_name.endswith(".onnx_data"):
@@ -153,7 +152,7 @@ def main():
         staged_data_path = os.path.join(staging_dir, new_data_name)
         shutil.copyfile(cached_data, staged_data_path)
 
-    # 4. Load graph structure (load_external_data=False keeps 2GB weights off RAM)
+    # 4. Load graph structure
     print("Loading ONNX model graph structure...")
     onnx_model = onnx.load(cached_onnx, load_external_data=False)
 
@@ -165,10 +164,14 @@ def main():
                 if ext.key == "location" and ext.value == old_data_name:
                     ext.value = new_data_name
 
-    # 6. Decompose non-standard SimplifiedLayerNormalization nodes
-    onnx_model = decompose_simplified_layer_norm(onnx_model)
+    # 6. Decompose non-standard nodes IN-PLACE
+    onnx_model = decompose_simplified_layer_norm_in_place(onnx_model)
 
-    # 7. Save updated model back to staging directory
+    # 7. Local graph integrity check
+    print("Verifying graph topological sorting and node validity...")
+    onnx.checker.check_model(onnx_model, full_check=False)
+
+    # 8. Save updated model back to staging directory
     print(f"Saving modified ONNX model to '{staged_onnx_path}'...")
     onnx.save(onnx_model, staged_onnx_path)
 

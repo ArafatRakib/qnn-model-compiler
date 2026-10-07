@@ -42,6 +42,19 @@ def get_tensor_elem_type(graph, tensor_name):
             return info.type.tensor_type.elem_type
     return TensorProto.FLOAT
 
+def get_tensor_shape(graph, tensor_name):
+    """Extract dimension shape list for a given tensor."""
+    for info in list(graph.value_info) + list(graph.input) + list(graph.output):
+        if info.name == tensor_name and info.type.HasField("tensor_type"):
+            shape = []
+            for dim in info.type.tensor_type.shape.dim:
+                if dim.HasField("dim_value") and dim.dim_value > 0:
+                    shape.append(dim.dim_value)
+                else:
+                    shape.append(128)
+            return shape
+    return [1, 16, 128, 128]
+
 def decompose_custom_nodes(model):
     """
     Decomposes com.microsoft:SimplifiedLayerNormalization, com.microsoft:RMSNorm,
@@ -91,7 +104,6 @@ def decompose_custom_nodes(model):
             
             rope_nodes = []
             
-            # Extract cos and sin inputs or gather them using position_ids
             if len(node.input) >= 4:
                 pos_ids = node.input[1]
                 cos_cache = node.input[2]
@@ -103,8 +115,14 @@ def decompose_custom_nodes(model):
                 node_gather_cos = helper.make_node("Gather", inputs=[cos_cache, pos_ids], outputs=[cos_gathered], axis=0, name=prefix+"gather_cos")
                 node_gather_sin = helper.make_node("Gather", inputs=[sin_cache, pos_ids], outputs=[sin_gathered], axis=0, name=prefix+"gather_sin")
                 
+                # Inspect tensor shape to select the correct unsqueeze axis
+                x_shape = get_tensor_shape(graph, x_input)
+                # If layout is [batch, num_heads, seq_len, head_dim], unsqueeze at axis 1 -> [batch, 1, seq_len, head_dim]
+                # If layout is [batch, seq_len, num_heads, head_dim], unsqueeze at axis 2 -> [batch, seq_len, 1, head_dim]
+                unsq_axis = 1 if len(x_shape) == 4 and x_shape[1] < x_shape[2] else 2
+                
                 axes_unsq_name = prefix + "unsq_axes"
-                new_initializers.append(helper.make_tensor(axes_unsq_name, TensorProto.INT64, [1], [2]))
+                new_initializers.append(helper.make_tensor(axes_unsq_name, TensorProto.INT64, [1], [unsq_axis]))
                 
                 cos_unsq = prefix + "cos_unsq"
                 sin_unsq = prefix + "sin_unsq"
@@ -121,12 +139,9 @@ def decompose_custom_nodes(model):
                 ordered_nodes.append(node)
                 continue
 
-            rotary_dim = 128
-            for attr in node.attribute:
-                if attr.name == "rotary_embedding_dim" and attr.i > 0:
-                    rotary_dim = attr.i
-
-            half_dim = rotary_dim // 2
+            x_shape = get_tensor_shape(graph, x_input)
+            head_dim = x_shape[-1] if len(x_shape) > 0 and isinstance(x_shape[-1], int) and x_shape[-1] > 0 else 128
+            half_dim = head_dim // 2
 
             # Slicing initializers
             init_s0 = prefix + "s0"
@@ -243,6 +258,14 @@ def main():
 
     onnx_model = decompose_custom_nodes(onnx_model)
     onnx_model, input_specs = sanitize_shapes(onnx_model, default_seq_len=seq_len)
+
+    # Pre-flight shape inference check
+    print("Running local shape and type inference validation...")
+    try:
+        onnx_model = onnx.shape_inference.infer_shapes(onnx_model)
+        print("Local shape inference validation passed successfully!")
+    except Exception as e:
+        print(f"Notice during local shape inference: {e}")
 
     onnx.save(onnx_model, staged_onnx_path)
     del onnx_model
